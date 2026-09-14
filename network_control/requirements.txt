@@ -1,0 +1,6 @@
+# Flask 网络服务
+Flask>=3.0
+
+# 真实硬件模式复用手动遥控模块的依赖
+pyserial>=3.5
+pymavlink>=2.4

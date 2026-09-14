@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CONTROL · 网络控制</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <!-- 顶部应用栏：展示项目名称和网络服务连接状态。 -->
+  <header class="app-bar">
+    <div class="brand-mark" aria-hidden="true">C</div>
+    <div>
+      <p class="eyebrow">CONTROL</p>
+      <h1>网络控制</h1>
+    </div>
+    <div class="connection-chip" id="connectionChip"><span class="status-dot"></span><span id="connectionText">连接检查中</span></div>
+  </header>
+
+  <!-- 页面主体：先展示运行模式，再按地面和飞行两个独立卡片组织控制功能。 -->
+  <main class="page-shell">
+    <section class="hero-card surface-card">
+      <div>
+        <p class="eyebrow">陆空两栖控制台</p>
+        <h2>安全、清晰地控制你的载具</h2>
+        <p class="supporting">网络控制是 CONTROL 的独立模块。默认以仿真模式启动，连接真实硬件必须使用命令行开关明确授权。</p>
+      </div>
+      <div class="hero-status">
+        <span class="label">运行模式</span>
+        <strong id="runtimeMode">SIMULATION</strong>
+        <span class="label" id="serverMessage">等待状态</span>
+      </div>
+    </section>
+
+    <section class="dashboard-grid">
+      <!-- 地面控制卡片：四个方向按钮和键盘输入共用同一套归一化控制量。 -->
+      <article class="surface-card control-card ground-card">
+        <div class="card-heading">
+          <div><p class="eyebrow">GROUND</p><h2>地面控制</h2></div>
+          <span class="state-pill" id="groundState">仿真</span>
+        </div>
+        <p class="supporting">按住按钮、方向键或 WASD 持续行驶，松开后自动停车；快速双击“前”可进入疾跑。</p>
+        <div class="direction-pad" aria-label="地面车方向控制">
+          <button class="direction-button forward" data-direction="forward" type="button" aria-label="前进"><span class="direction-icon">↑</span><span>前</span><kbd>↑ / W</kbd></button>
+          <button class="direction-button left" data-direction="left" type="button" aria-label="左转"><span class="direction-icon">←</span><span>左</span><kbd>← / A</kbd></button>
+          <div class="direction-center" aria-hidden="true">方向</div>
+          <button class="direction-button right" data-direction="right" type="button" aria-label="右转"><span class="direction-icon">→</span><span>右</span><kbd>→ / D</kbd></button>
+          <button class="direction-button backward" data-direction="backward" type="button" aria-label="后退"><span class="direction-icon">↓</span><span>后</span><kbd>↓ / S</kbd></button>
+        </div>
+        <div class="ground-readout"><span>当前动作 <b id="groundAction">停车</b></span><span class="sprint-indicator" id="groundSprintState">疾跑未启用</span></div>
+        <div class="ground-actions">
+          <button class="tonal-button" id="groundStopButton" type="button">立即停车</button>
+          <button class="filled-button autonomy-button" id="autonomyButton" type="button">自主运行</button>
+        </div>
+        <p class="autonomy-hint" id="autonomyHint">自主运行默认朝摄像头正前方行进，并使用深度相机自动避障；启动时会暂时暂停深度预览。</p>
+      </article>
+
+      <!-- 飞行控制卡片：状态、模式、目标参数和高风险动作集中展示。 -->
+      <article class="surface-card control-card flight-card">
+        <div class="card-heading">
+          <div><p class="eyebrow">FLIGHT</p><h2>飞行控制</h2></div>
+          <div class="flight-badges"><span class="state-pill" id="flightState">未连接</span><span class="armed-badge disarmed" id="flightArmedBadge"><span class="armed-dot"></span><span id="flightArmedText">已上锁</span></span></div>
+        </div>
+        <p class="supporting">开启后先建立连续 setpoint 流，再允许切换 OFFBOARD 和解锁。</p>
+        <div class="metric-grid">
+          <div class="metric"><span>模式</span><strong id="flightMode">—</strong></div>
+          <div class="metric"><span>解锁</span><strong id="flightArmed">否</strong></div>
+          <div class="metric"><span>电池</span><strong id="batteryValue">—</strong></div>
+          <div class="metric"><span>相对高度</span><strong id="altitudeValue">—</strong></div>
+        </div>
+        <div class="switch-row">
+          <div><strong>启用网络飞行控制</strong><span>仅用于验证链路，松开后会触发超时保护。</span></div>
+          <label class="switch"><input id="flightControlSwitch" type="checkbox"><span class="switch-track"><span class="switch-thumb"></span></span></label>
+        </div>
+        <div class="debug-row">
+          <div><strong>调试：未起飞自动上锁</strong><span id="preflightDisarmState">当前启用，约 10 秒未起飞会自动上锁</span></div>
+          <button class="outlined-button debug-button" id="debugPreflightButton" type="button">关闭自动上锁</button>
+        </div>
+        <div class="field-row">
+          <label for="modeSelect">飞行模式</label>
+          <select id="modeSelect">
+            <option>MANUAL</option><option>STABILIZED</option><option>ALTCTL</option><option>POSCTL</option><option>OFFBOARD</option><option>AUTO.LAND</option>
+          </select>
+          <button class="tonal-button" id="modeButton" type="button">切换</button>
+        </div>
+        <div class="sliders">
+          <label>横滚 <output id="rollOutput">0.00</output><input id="rollSlider" type="range" min="-1" max="1" step="0.01" value="0"></label>
+          <label>俯仰 <output id="pitchOutput">0.00</output><input id="pitchSlider" type="range" min="-1" max="1" step="0.01" value="0"></label>
+          <label>偏航 <output id="yawOutput">0.00</output><input id="yawSlider" type="range" min="-1" max="1" step="0.01" value="0"></label>
+          <label>推力 <output id="thrustOutput">0.00</output><input id="thrustSlider" type="range" min="0" max="1" step="0.01" value="0"></label>
+        </div>
+        <div class="action-row">
+          <button class="outlined-button" id="armButton" type="button">解锁</button>
+          <button class="outlined-button" id="disarmButton" type="button">上锁</button>
+          <button class="danger-button" id="emergencyButton" type="button">紧急降落</button>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <!-- 高风险飞控动作统一使用确认对话框，避免误触。 -->
+  <dialog id="confirmDialog">
+    <form method="dialog" class="dialog-card">
+      <h2 id="dialogTitle">请确认操作</h2><p id="dialogMessage"></p>
+      <div class="dialog-actions"><button class="text-button" value="cancel">取消</button><button class="filled-button" id="dialogConfirm" value="confirm">确认</button></div>
+    </form>
+  </dialog>
+  <div class="snackbar" id="snackbar" role="status"></div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
