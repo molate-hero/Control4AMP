@@ -1,0 +1,5 @@
+# PX4 MAVLink 通信库
+pymavlink>=2.4
+
+# ESP32 串口通信库
+pyserial>=3.5
