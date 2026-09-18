@@ -28,6 +28,8 @@ network_control/
 
 地面卡片中的“自主运行”按钮会启动 `autonomous/ground_avoidance` 的 RealSense 合力法避障线程。启动前服务会确认飞控未解锁，并暂时暂停占用相机的 `/home/orangepi/run_depth.sh` 深度预览；停止自主运行时会停车并恢复原来正在运行的预览服务。自主运行期间后端拒绝手动地面输入，网页按钮再次点击即可停止。
 
+地面卡片中的“AI auto”按钮会启动 `autonomous/vlm_navigation` 的 VLM 视觉导航循环：连续拍摄彩色画面交给视觉大模型，由模型通过 function calling 下发前进/后退/旋转动作，默认目标是向前探索。它与“自主运行”互斥（两者都要独占 RealSense，同时只能运行一个），同样会暂停并恢复深度预览、启动前确认飞控未解锁、运行期间拒绝手动地面输入；提示行会显示当前步数、动作和原因。AI auto 需要在本模块侧配置 VLM 的 API key（见 `autonomous/vlm_navigation/.env.example`）。
+
 ## 使用方法
 
 ```bash
@@ -54,7 +56,7 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 
 ## API 概览
 
-`GET /api/status` 获取服务、地面车和飞控状态；`POST /api/ground/control` 与 `/api/ground/stop` 控制地面车；`POST /api/ground/autonomy` 启动或停止地面自动避障；`POST /api/fc/control` 显式建立或关闭网络 setpoint 流；`POST /api/fc/setpoint` 发送飞行目标；`POST /api/fc/mode`、`/api/fc/arm`、`/api/fc/disarm` 和 `/api/fc/emergency` 执行需要明确操作的飞控命令；`POST /api/fc/debug/preflight-disarm` 是拆桨调试用的 PX4 自动上锁参数开关。
+`GET /api/status` 获取服务、地面车和飞控状态；`POST /api/ground/control` 与 `/api/ground/stop` 控制地面车；`POST /api/ground/autonomy` 启动或停止地面自动避障；`POST /api/ground/ai-auto` 启动或停止 VLM 视觉导航（`AI auto`）；`POST /api/fc/control` 显式建立或关闭网络 setpoint 流；`POST /api/fc/setpoint` 发送飞行目标；`POST /api/fc/mode`、`/api/fc/arm`、`/api/fc/disarm` 和 `/api/fc/emergency` 执行需要明确操作的飞控命令；`POST /api/fc/debug/preflight-disarm` 是拆桨调试用的 PX4 自动上锁参数开关。
 
 网页操作顺序是：打开网络飞行控制开关，等待状态显示 `Offboard 就绪`，再切换到 `OFFBOARD`，最后在确认安全后解锁。服务端会拒绝没有连续 setpoint 流时的 OFFBOARD 切换和网络解锁。
 

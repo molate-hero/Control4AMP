@@ -65,6 +65,32 @@ class NetworkApiTest(unittest.TestCase):
         response = self.client.post("/api/ground/autonomy", json={"enabled": True})
         self.assertEqual(response.status_code, 409)
 
+    def test_simulation_rejects_ai_auto(self) -> None:
+        """仿真服务不能误启动真实的 VLM AI 自动运行。"""
+
+        response = self.client.post("/api/ground/ai-auto", json={"enabled": True})
+        self.assertEqual(response.status_code, 409)
+
+    def test_ai_auto_requires_boolean(self) -> None:
+        """enabled 必须是布尔值，否则返回 400。"""
+
+        response = self.client.post("/api/ground/ai-auto", json={"enabled": "yes"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_status_reports_ai_auto_fields(self) -> None:
+        """状态接口应包含 AI auto 字段，供网页显示。"""
+
+        ground = self.client.get("/api/status").get_json()["ground"]
+        self.assertIn("ai_auto_enabled", ground)
+        self.assertFalse(ground["ai_auto_enabled"])
+        self.assertIn("ai_auto_reason", ground)
+
+    def test_stop_is_safe_when_ai_auto_disabled(self) -> None:
+        """AI auto 未运行时的停车请求应正常返回。"""
+
+        response = self.client.post("/api/ground/stop", json={})
+        self.assertEqual(response.get_json()["command"], "S")
+
 
 if __name__ == "__main__":
     unittest.main()

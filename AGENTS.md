@@ -20,6 +20,7 @@ OPi连接地址为：
 - 重要技术决策写入 `.ai/DECISIONS.md`中
 
 ## 现有模块
-- `manual_control`：
-- `network_control`：
-- `autonomous`：
+- `manual_control`：遥控器经 PX4 RC 通道控制 ESP32 地面车的手动遥控桥，含 AIR/GROUND 控制权分配和安全停车。
+- `network_control`：Flask 浏览器控制台，提供地面车网络遥控、PX4 飞行 setpoint 和自主避障 / `AI auto` 视觉导航启动入口。
+- `autonomous`：自主控制；当前包含 `ground_avoidance`（RealSense 深度合力法地面避障）与 `vlm_navigation`（VLM 视觉导航闭环，拍照→大模型决策→地面动作，只控制地面车）。
+- `mechanical`：机械设计；当前包含 `car_shell`，即用 Blender 脚本参数化生成的一体式小车外壳与后部滑盖。

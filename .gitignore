@@ -31,3 +31,11 @@ htmlcov/
 # Patch and merge backup files
 *.orig
 *.rej
+
+# Generated preview renders (regenerate via mechanical/car_shell/build_car_shell.py)
+mechanical/car_shell/renders/
+
+# Blender auto-saved previous version of a .blend file
+*.blend1
+
+.zcode/

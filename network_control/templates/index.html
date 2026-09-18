@@ -51,8 +51,10 @@
         <div class="ground-actions">
           <button class="tonal-button" id="groundStopButton" type="button">立即停车</button>
           <button class="filled-button autonomy-button" id="autonomyButton" type="button">自主运行</button>
+          <button class="filled-button ai-auto-button" id="aiAutoButton" type="button">AI auto</button>
         </div>
         <p class="autonomy-hint" id="autonomyHint">自主运行默认朝摄像头正前方行进，并使用深度相机自动避障；启动时会暂时暂停深度预览。</p>
+        <p class="autonomy-hint" id="aiAutoHint">AI auto 由视觉大模型根据彩色画面决定前进/后退/旋转，默认目标是向前探索；需要在本模块的 .env 中配置 API key。</p>
       </article>
 
       <!-- 飞行控制卡片：状态、模式、目标参数和高风险动作集中展示。 -->

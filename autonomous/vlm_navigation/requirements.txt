@@ -1,0 +1,7 @@
+# 图像处理与相机
+numpy>=1.21
+Pillow>=10.0
+pyrealsense2>=2.50
+
+# 复用 manual_control 的地面串口控制器
+pyserial>=3.5

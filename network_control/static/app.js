@@ -6,6 +6,7 @@ const state = {
   sprint: false,
   lastForwardTap: 0,
   autonomyEnabled: false,
+  aiAutoEnabled: false,
   flightActive: false,
   flightTimer: null,
   pendingAction: null,
@@ -24,6 +25,8 @@ async function api(path, options = {}) {
   return data;
 }
 function fixed(value) { return Number(value).toFixed(2); }
+// 只要任一自动运行（深度避障或 AI auto）在跑，就拒绝手动地面输入。
+function autoRunning() { return state.autonomyEnabled || state.aiAutoEnabled; }
 
 // 根据当前按下的方向生成归一化差速输入。普通行驶限速，疾跑只作用于持续前进。
 function groundValues() {
@@ -63,7 +66,7 @@ function registerForwardTap() {
   state.lastForwardTap = now;
 }
 function setGroundSource(direction, source, active) {
-  if (state.autonomyEnabled) return;
+  if (autoRunning()) return;
   const sources = state.groundSources.get(direction);
   if (active) sources.add(source); else sources.delete(source);
   if (!active && direction === "forward" && sources.size === 0) state.sprint = false;
@@ -74,8 +77,8 @@ function setGroundSource(direction, source, active) {
 function clearGroundInputs() {
   state.groundSources.forEach((sources) => sources.clear());
   state.sprint = false; refreshGroundVisuals(); clearGroundTimer();
-  // 浏览器失焦时只清理手动输入；自主运行不应因切换窗口而被停车。
-  if (!state.autonomyEnabled) sendGroundStop();
+  // 浏览器失焦时只清理手动输入；自动运行不应因切换窗口而被停车。
+  if (!autoRunning()) sendGroundStop();
 }
 function bindGroundButtons() {
   document.querySelectorAll(".direction-button").forEach((button) => {
@@ -93,7 +96,7 @@ function bindGroundButtons() {
 const keyboardDirections = { ArrowUp: "forward", ArrowDown: "backward", ArrowLeft: "left", ArrowRight: "right", KeyW: "forward", KeyS: "backward", KeyA: "left", KeyD: "right" };
 document.addEventListener("keydown", (event) => {
   const direction = keyboardDirections[event.code]; if (!direction) return;
-  if (state.autonomyEnabled) return;
+  if (autoRunning()) return;
   event.preventDefault(); if (event.repeat) return;
   if (direction === "forward") registerForwardTap();
   setGroundSource(direction, `key-${event.code}`, true);
@@ -102,7 +105,7 @@ document.addEventListener("keyup", (event) => {
   const direction = keyboardDirections[event.code]; if (!direction) return;
   event.preventDefault(); setGroundSource(direction, `key-${event.code}`, false);
 });
-window.addEventListener("blur", () => { if (!state.autonomyEnabled) clearGroundInputs(); });
+window.addEventListener("blur", () => { if (!autoRunning()) clearGroundInputs(); });
 
 // 读取页面中的飞行目标滑块，并按固定频率保持网络 setpoint 新鲜。
 function flightValues() { return { roll: $("rollSlider").value, pitch: $("pitchSlider").value, yaw: $("yawSlider").value, thrust: $("thrustSlider").value }; }
@@ -132,10 +135,14 @@ async function refreshStatus() {
     $("connectionChip").classList.toggle("offline", data.hardware && !flight.connected); $("connectionText").textContent = data.hardware && !flight.connected ? "飞控未连接" : "服务在线";
     $("groundState").textContent = ground.mode === "LIVE" ? "在线" : "仿真"; $("flightState").textContent = flight.connected ? "在线" : "未连接";
     state.autonomyEnabled = Boolean(ground.autonomy_enabled);
+    state.aiAutoEnabled = Boolean(ground.ai_auto_enabled);
     $("autonomyButton").textContent = state.autonomyEnabled ? "关闭自主运行" : "自主运行";
     $("autonomyButton").classList.toggle("autonomy-active", state.autonomyEnabled);
     $("autonomyHint").textContent = ground.autonomy_error || (state.autonomyEnabled ? `自主运行中：${ground.autonomy_reason || "正在读取深度"}` : "自主运行会使用深度相机自动避障；启动时会暂时暂停深度预览。");
-    document.querySelectorAll(".direction-button").forEach((button) => { button.disabled = state.autonomyEnabled; });
+    $("aiAutoButton").textContent = state.aiAutoEnabled ? "关闭 AI auto" : "AI auto";
+    $("aiAutoButton").classList.toggle("ai-auto-active", state.aiAutoEnabled);
+    $("aiAutoHint").textContent = ground.ai_auto_error || (state.aiAutoEnabled ? `AI auto 运行中（第 ${ground.ai_auto_step || 0} 步 / ${ground.ai_auto_action || "思考中"}）：${ground.ai_auto_reason || "正在读取画面"}` : "AI auto 由视觉大模型根据彩色画面决定前进/后退/旋转，默认目标是向前探索；需要在本模块的 .env 中配置 API key。");
+    document.querySelectorAll(".direction-button").forEach((button) => { button.disabled = autoRunning(); });
     $("flightMode").textContent = flight.mode || "—"; $("flightArmed").textContent = flight.armed ? "是" : "否";
     $("flightState").textContent = flight.offboard_ready ? "Offboard 就绪" : (flight.connected ? "在线" : "未连接");
     $("flightArmedBadge").classList.toggle("armed", flight.armed); $("flightArmedBadge").classList.toggle("disarmed", !flight.armed);
@@ -160,7 +167,12 @@ async function runAction(action) {
       // 立即更新本地状态，避免启动请求返回到状态轮询之间被失焦逻辑误判为手动模式。
       state.autonomyEnabled = true;
     }
-    showMessage(action === "autonomy-start" ? "自主运行已启动" : "命令已发送");
+    if (action === "ai-auto-start") {
+      await api("/api/ground/ai-auto", { method: "POST", body: JSON.stringify({ enabled: true }) });
+      // 同上：先本地置位，避免启动与状态轮询之间被误判为手动模式。
+      state.aiAutoEnabled = true;
+    }
+    showMessage(action === "autonomy-start" ? "自主运行已启动" : action === "ai-auto-start" ? "AI auto 已启动" : "命令已发送");
     await refreshStatus();
   } catch (error) { showMessage(error.message); }
 }
@@ -168,8 +180,13 @@ async function runAction(action) {
 bindGroundButtons();
 $("groundStopButton").addEventListener("click", async () => {
   clearGroundInputs();
+  // 立即停车请求会在服务端停止正在运行的自动任务。
   if (state.autonomyEnabled) {
     try { await api("/api/ground/autonomy", { method: "POST", body: JSON.stringify({ enabled: false }) }); state.autonomyEnabled = false; }
+    catch (error) { showMessage(error.message); return; }
+  }
+  if (state.aiAutoEnabled) {
+    try { await api("/api/ground/ai-auto", { method: "POST", body: JSON.stringify({ enabled: false }) }); state.aiAutoEnabled = false; }
     catch (error) { showMessage(error.message); return; }
   }
   showMessage("已发送停车命令");
@@ -180,6 +197,14 @@ $("autonomyButton").addEventListener("click", async () => {
     catch (error) { showMessage(error.message); }
   } else {
     openConfirm("启动自主运行？", "地面车将根据 RealSense 深度相机自动行驶并避障；启动时会暂停深度预览。请确认车辆周围安全。", "autonomy-start");
+  }
+});
+$("aiAutoButton").addEventListener("click", async () => {
+  if (state.aiAutoEnabled) {
+    try { await api("/api/ground/ai-auto", { method: "POST", body: JSON.stringify({ enabled: false }) }); showMessage("AI auto 已停止"); await refreshStatus(); }
+    catch (error) { showMessage(error.message); }
+  } else {
+    openConfirm("启动 AI auto？", "AI 将连续拍摄彩色画面并调用视觉大模型决定前进/后退/旋转，默认目标是向前探索。启动时会暂停深度预览，并需要配置 API key。请确认车辆周围安全。", "ai-auto-start");
   }
 });
 ["roll", "pitch", "yaw", "thrust"].forEach((name) => $(`${name}Slider`).addEventListener("input", () => { refreshSliderLabels(); if (state.flightActive) sendFlightSetpoint(); }));

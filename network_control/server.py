@@ -21,12 +21,16 @@ from flask import Flask, jsonify, render_template, request
 # 复用手动遥控模块中已经验证过的串口控制、差速计算和 PX4 通信基础类。
 MODULE_ROOT = Path(__file__).resolve().parents[1] / "manual_control"
 AUTONOMY_ROOT = Path(__file__).resolve().parents[1] / "autonomous" / "ground_avoidance"
+# VLM 视觉导航模块只在真正启动 AI 自动运行时才延迟导入（它依赖相机与网络）。
+VLM_ROOT = Path(__file__).resolve().parents[1] / "autonomous" / "vlm_navigation"
 import sys
 
 if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 if str(AUTONOMY_ROOT) not in sys.path:
     sys.path.insert(0, str(AUTONOMY_ROOT))
+if str(VLM_ROOT) not in sys.path:
+    sys.path.insert(0, str(VLM_ROOT))
 
 from control.channels import build_axis_command
 from control.ground_controller import GroundController
@@ -92,6 +96,23 @@ class NetworkController:
         self._autonomy_stop_event = threading.Event()
         self._autonomy_source: Any = None
         self._depth_preview_was_running = False
+        # AI 自动运行（VLM 视觉导航）：与深度避障互斥，二者都要独占 RealSense。
+        self._ai_auto_enabled = False
+        self._ai_auto_error: str | None = None
+        self._ai_auto_status: dict[str, Any] = {
+            "step": 0,
+            "action": "",
+            "command": "S",
+            "reason": "未启动",
+            "text": "",
+            "error": None,
+        }
+        self._ai_auto_thread: threading.Thread | None = None
+        self._ai_auto_stop_event = threading.Event()
+        self._ai_auto_camera: Any = None
+        # 会话编号：stop 的 join 超时后线程仍在收尾，若此时用户立刻重启，
+        # 旧线程必须能识别出"自己已经过期"，不能去关掉新会话的相机或清掉新状态。
+        self._ai_auto_session = 0
 
     def start(self) -> None:
         """启动连接和后台安全线程。"""
@@ -127,6 +148,7 @@ class NetworkController:
     def close(self) -> None:
         """停止线程，先停车，再关闭硬件连接。"""
 
+        self.stop_ai_auto()
         self.stop_autonomy()
         self._stop_event.set()
         try:
@@ -195,6 +217,8 @@ class NetworkController:
         with self._lock:
             if self._autonomy_enabled:
                 return True
+            if self._ai_auto_enabled:
+                raise RuntimeError("AI 自动运行正在运行，请先停止后再启动深度避障")
 
         try:
             from potential_field import PotentialFieldAvoider
@@ -289,12 +313,213 @@ class NetworkController:
                     self._autonomy_thread = None
                 self._resume_depth_preview()
 
+    def _note_ai_auto_command(self, _command: str) -> None:
+        """AI 自动运行每次下发指令时刷新地面看门狗。
+
+        地面看门狗会在 0.5 秒没有新输入时强制停车，VLM 决策一轮往往不止 0.5 秒，
+        因此这里在动作执行期间持续刷新；两次动作之间的"思考"时间没有指令，
+        看门狗会让车停下来等待，这正是期望的安全行为。
+        """
+
+        with self._lock:
+            self._ground_last_input = time.monotonic()
+            self._ground_sent_count += 1
+
+    def _set_ai_auto_status(self, status: dict[str, Any]) -> None:
+        """接收导航循环上报的状态，供网页显示。"""
+
+        with self._lock:
+            self._ai_auto_status = dict(status)
+
+    def start_ai_auto(self) -> bool:
+        """启动 VLM 视觉导航循环（AI auto）。
+
+        与深度避障互斥：两者都要独占 RealSense。启动前会暂停深度预览以释放相机，
+        停止时再恢复。
+        """
+
+        if not self.hardware:
+            raise RuntimeError("当前为仿真模式，不能启动真实 AI 自动运行")
+        if self.px4 is not None and self.px4.snapshot.armed:
+            raise RuntimeError("飞控已解锁，不能启动地面 AI 自动运行")
+        with self._lock:
+            if self._ai_auto_enabled:
+                return True
+            if self._autonomy_enabled:
+                raise RuntimeError("深度避障正在运行，请先停止后再启动 AI 自动运行")
+
+        camera = None
+        try:
+            import vlm_config
+            from motion import MotionExecutor
+            from navigation_loop import VlmNavigationLoop
+            from realsense_color_source import RealSenseColorSource
+            from vlm_client import VlmClient
+
+            settings = vlm_config.load_vlm_settings()
+            if not settings["api_key"]:
+                raise RuntimeError("缺少 VLM API key，请在本模块的 .env 中设置 DEEPSEEK_API_KEY")
+
+            vlm_settings = vlm_config.VlmConfig()
+            camera_config = vlm_config.CameraConfig()
+            motion_config = vlm_config.MotionConfig()
+
+            # 客户端不占用硬件，先构造好再暂停深度预览，避免失败时白白打断预览。
+            client = VlmClient(
+                base_url=settings["base_url"],
+                api_key=settings["api_key"],
+                model=settings["model"],
+                timeout_seconds=vlm_settings.timeout_seconds,
+            )
+            self._pause_depth_preview()
+            camera = RealSenseColorSource(
+                width=camera_config.width,
+                height=camera_config.height,
+                fps=camera_config.fps,
+                jpeg_quality=camera_config.jpeg_quality,
+                frame_timeout_ms=camera_config.frame_timeout_ms,
+            )
+            camera.start()
+        except Exception as exc:
+            if camera is not None:
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+            self._resume_depth_preview()
+            raise RuntimeError(f"AI 自动运行未能启动：{exc}") from exc
+
+        # 运动执行器直接复用已连接的地面串口控制器，指令会刷新看门狗。
+        executor = MotionExecutor(
+            self.ground,
+            tick_seconds=motion_config.tick_seconds,
+            max_action_seconds=motion_config.max_action_seconds,
+            max_speed=motion_config.max_speed,
+            stop_event=self._ai_auto_stop_event,
+            on_command=self._note_ai_auto_command,
+        )
+        loop = VlmNavigationLoop(
+            camera=camera,
+            client=client,
+            executor=executor,
+            stop_event=self._ai_auto_stop_event,
+            goal=vlm_settings.goal,
+            on_status=self._set_ai_auto_status,
+            max_context_images=vlm_settings.max_context_images,
+            max_steps=vlm_settings.max_steps,
+            max_consecutive_text_only=vlm_settings.max_consecutive_text_only,
+            max_api_failures=vlm_settings.max_api_failures,
+            request_interval_seconds=vlm_settings.request_interval_seconds,
+        )
+
+        with self._lock:
+            self._ai_auto_camera = camera
+            self._ai_auto_error = None
+            self._ai_auto_status = {
+                "step": 0,
+                "action": "",
+                "command": "S",
+                "reason": "正在初始化",
+                "text": "",
+                "error": None,
+            }
+            self._ai_auto_stop_event.clear()
+            self._ai_auto_enabled = True
+            self._ai_auto_session += 1
+            session = self._ai_auto_session
+            self._ai_auto_thread = threading.Thread(
+                target=self._ai_auto_loop,
+                args=(loop, camera, session),
+                name="vlm-ai-auto-loop",
+                daemon=True,
+            )
+            self._ai_auto_thread.start()
+        print("[AI-AUTO] VLM 视觉导航已启动", flush=True)
+        return True
+
+    def stop_ai_auto(self) -> bool:
+        """停止 AI 自动运行线程、发送停车并恢复深度预览。"""
+
+        with self._lock:
+            thread = self._ai_auto_thread
+            was_enabled = self._ai_auto_enabled or thread is not None
+            self._ai_auto_stop_event.set()
+            # 递增会话号：即使下面的 join 超时，旧线程收尾时也不会误动新会话状态。
+            self._ai_auto_session += 1
+        if thread is not None and thread is not threading.current_thread():
+            # 若此刻正卡在一次 VLM 网络请求上，join 可能超时；此时线程会在请求返回后
+            # 自行收尾（关闭相机、恢复预览），而电机已经由下面的 stop 立即停住。
+            thread.join(timeout=8.0)
+        with self._lock:
+            self._ai_auto_thread = None
+            self._ai_auto_enabled = False
+            self._ai_auto_camera = None
+            self._ai_auto_status["command"] = "S"
+        self.ground.stop()
+        self._resume_depth_preview()
+        if was_enabled:
+            print("[AI-AUTO] VLM 视觉导航已停止", flush=True)
+        return False
+
+    def ai_auto_status(self) -> dict[str, Any]:
+        """返回网页显示所需的 AI 自动运行状态。"""
+
+        with self._lock:
+            status = dict(self._ai_auto_status)
+            return {
+                "enabled": self._ai_auto_enabled,
+                "error": status.get("error") or self._ai_auto_error,
+                "step": status.get("step", 0),
+                "action": status.get("action", ""),
+                "command": status.get("command", "S"),
+                "reason": status.get("reason", "未启动"),
+            }
+
+    def _ai_auto_loop(self, loop: Any, camera: Any, session: int) -> None:
+        """在后台线程里跑 VLM 导航循环，并负责收尾清理。
+
+        `camera` 与 `session` 都由启动时捕获，不再回头读 `self._ai_auto_camera`：
+        线程可能因为 join 超时而晚于"下一次启动"才收尾，那时共享字段已经是新会话的了。
+        """
+
+        def is_current() -> bool:
+            with self._lock:
+                return self._ai_auto_session == session
+
+        try:
+            result = loop.run()
+            if is_current():
+                with self._lock:
+                    self._ai_auto_status = dict(result)
+        except Exception as exc:
+            if is_current():
+                with self._lock:
+                    self._ai_auto_error = str(exc)
+                    self._ai_auto_status["reason"] = "AI 自动运行异常，已停车"
+            print(f"[AI-AUTO] 运行异常：{exc}", flush=True)
+        finally:
+            try:
+                if camera is not None:
+                    camera.close()
+            finally:
+                # 只有仍属于当前会话时才动共享状态；过期线程只需关掉自己的相机。
+                if is_current():
+                    self.ground.stop()
+                    with self._lock:
+                        self._ai_auto_camera = None
+                        self._ai_auto_enabled = False
+                        self._ai_auto_thread = None
+                        self._ai_auto_status["command"] = "S"
+                    self._resume_depth_preview()
+
     def ground_control(self, throttle: float, steering: float) -> str:
         """接收网页方向输入，转换并发送地面车命令。"""
 
         with self._lock:
             if self._autonomy_enabled:
                 raise RuntimeError("自主运行中，不能同时接收手动地面控制")
+            if self._ai_auto_enabled:
+                raise RuntimeError("AI 自动运行中，不能同时接收手动地面控制")
 
         throttle = max(-1.0, min(1.0, float(throttle)))
         steering = max(-1.0, min(1.0, float(steering)))
@@ -308,6 +533,9 @@ class NetworkController:
     def ground_stop(self) -> None:
         """立即停车并刷新地面控制看门狗。"""
 
+        if self._ai_auto_enabled:
+            self.stop_ai_auto()
+            return
         if self._autonomy_enabled:
             self.stop_autonomy()
             return
@@ -474,6 +702,7 @@ class NetworkController:
         with self._lock:
             ground_age = time.monotonic() - self._ground_last_input
             sent_count = self._ground_sent_count
+        ai_auto = self.ai_auto_status()
         return {
             "hardware": self.hardware,
             "ground": {
@@ -487,6 +716,12 @@ class NetworkController:
                 "autonomy_error": self.autonomy_status()["error"],
                 "autonomy_command": self.autonomy_status()["command"],
                 "autonomy_reason": self.autonomy_status()["reason"],
+                "ai_auto_enabled": ai_auto["enabled"],
+                "ai_auto_error": ai_auto["error"],
+                "ai_auto_command": ai_auto["command"],
+                "ai_auto_reason": ai_auto["reason"],
+                "ai_auto_action": ai_auto["action"],
+                "ai_auto_step": ai_auto["step"],
             },
             "flight": self.flight_status(),
         }
@@ -637,6 +872,22 @@ def api_ground_autonomy():
         app.logger.exception("切换地面自主运行失败")
         return jsonify({"ok": False, "error": f"自主运行切换失败：{exc}"}), 409
     return jsonify({"ok": True, "enabled": enabled, "autonomy": current.autonomy_status()})
+
+
+@app.post("/api/ground/ai-auto")
+def api_ground_ai_auto():
+    """启动或停止 VLM 视觉导航（AI auto）。"""
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get("enabled"), bool):
+        return jsonify({"ok": False, "error": "enabled 必须是布尔值"}), 400
+    current = get_controller()
+    try:
+        enabled = current.start_ai_auto() if data["enabled"] else current.stop_ai_auto()
+    except Exception as exc:
+        app.logger.exception("切换 AI 自动运行失败")
+        return jsonify({"ok": False, "error": f"AI 自动运行切换失败：{exc}"}), 409
+    return jsonify({"ok": True, "enabled": enabled, "ai_auto": current.ai_auto_status()})
 
 
 @app.post("/api/fc/setpoint")
